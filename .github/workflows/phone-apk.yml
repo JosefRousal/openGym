@@ -1,0 +1,126 @@
+# Personal Android build for this fork: a signed APK for sideloading onto your own phone.
+# Nothing goes to a store or a public release. The APK lands in two private places:
+#   - a *draft* GitHub release called "Phone build" (drafts are visible only to people with push
+#     access, so open github.com/<you>/<fork>/releases on the phone while signed in and tap the APK)
+#   - the run's workflow artifact (zipped; handy from a desktop)
+#
+# Mirrors the `build:apk` job in .gitlab-ci.yml. Needs three repository secrets:
+#   ANDROID_KEYSTORE_B64       the keystore, base64-encoded (base64 -w0 my.keystore)
+#   ANDROID_KEYSTORE_PASSWORD  keystore password (also used as the key password)
+#   ANDROID_KEY_ALIAS          the key alias, e.g. opengym
+# Keep the keystore: every later build must be signed with the same key, or Android refuses to
+# install the update over the app already on the phone.
+name: Phone APK
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'frontend/**'
+      - 'catalogue/media/**'
+      - '.github/workflows/phone-apk.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: phone-apk
+  cancel-in-progress: true
+
+jobs:
+  apk:
+    # Upstream doesn't have the signing secrets; only forks that set them build this.
+    if: github.repository != 'DuarteSantos8/openGym'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      # Capacitor 7's Android project needs Java 21 for Gradle.
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: gradle/actions/setup-gradle@v5
+
+      - name: Check signing secrets
+        env:
+          ANDROID_KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          # An unsigned APK can't be installed, so there is no point building one.
+          missing=""
+          [ -n "$ANDROID_KEYSTORE_B64" ] || missing="$missing ANDROID_KEYSTORE_B64"
+          [ -n "$ANDROID_KEYSTORE_PASSWORD" ] || missing="$missing ANDROID_KEYSTORE_PASSWORD"
+          [ -n "$ANDROID_KEY_ALIAS" ] || missing="$missing ANDROID_KEY_ALIAS"
+          if [ -n "$missing" ]; then
+            echo "::error::Missing repository secrets:$missing (Settings -> Secrets and variables -> Actions)"
+            exit 1
+          fi
+
+      - name: Build mobile bundle
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build:mobile
+
+      - name: Build and sign APK
+        working-directory: frontend/android
+        env:
+          ANDROID_KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          set -eu
+          ./gradlew --no-daemon assembleRelease
+          VER="$(node -p "require('../package.json').version")"
+          SHA="$(git rev-parse --short HEAD)"
+          OUT="$GITHUB_WORKSPACE/openGym-$VER-$SHA.apk"
+          UNSIGNED=app/build/outputs/apk/release/app-release-unsigned.apk
+          BT="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)"
+          KS="$RUNNER_TEMP/release.jks"
+          echo "$ANDROID_KEYSTORE_B64" | base64 -d > "$KS"
+          "$BT/zipalign" -f -p 4 "$UNSIGNED" aligned.apk
+          "$BT/apksigner" sign \
+            --ks "$KS" \
+            --ks-pass env:ANDROID_KEYSTORE_PASSWORD \
+            --ks-key-alias "$ANDROID_KEY_ALIAS" \
+            --key-pass env:ANDROID_KEYSTORE_PASSWORD \
+            --out "$OUT" aligned.apk
+          rm -f "$KS"
+          "$BT/apksigner" verify --print-certs "$OUT"
+          (cd "$GITHUB_WORKSPACE" && sha256sum "$(basename "$OUT")" > "$(basename "$OUT").sha256")
+          echo "APK=$OUT" >> "$GITHUB_ENV"
+          echo "APK_VERSION=$VER" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openGym-apk
+          path: |
+            openGym-*.apk
+            openGym-*.apk.sha256
+          retention-days: 30
+
+      # One rolling draft release, replaced on every build. Drafts never create a tag and are
+      # hidden from anyone without push access, so this stays private even on a public fork.
+      - name: Update the private "Phone build" draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          for id in $(gh api "repos/$GITHUB_REPOSITORY/releases" --paginate \
+                        --jq '.[] | select(.draft and .name == "Phone build") | .id'); do
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/$id"
+          done
+          gh release create phone-build \
+            --draft \
+            --title "Phone build" \
+            --target "$GITHUB_SHA" \
+            --notes "openGym $APK_VERSION built from $GITHUB_SHA. Private draft: open this page on your phone while signed in to GitHub and tap the .apk to install." \
+            "$APK" "$APK.sha256"
